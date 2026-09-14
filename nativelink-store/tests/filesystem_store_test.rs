@@ -32,7 +32,7 @@ use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_store::filesystem_store::{
     DIGEST_FOLDER_V1, DIGEST_FOLDER_V2, EncodedFilePath, FileEntry, FileEntryImpl, FileType,
-    FilesystemStore, STR_FOLDER_V1, STR_FOLDER_V2, check_duplicate_files,
+    FilesystemStore, FsEvictingMap, Generation, STR_FOLDER_V1, STR_FOLDER_V2,
     key_and_generation_from_file_v2, make_temp_key,
 };
 use nativelink_util::buf_channel::make_buf_channel_pair;
@@ -52,7 +52,7 @@ use tokio::sync::{Barrier, Semaphore};
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReadDirStream;
-use tracing::{Instrument, debug, info};
+use tracing::{Instrument, debug, info, trace, warn};
 
 const VALID_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 
@@ -90,11 +90,17 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> Debug for TestFileEntry<Hook
 }
 
 impl<Hooks: FileEntryHooks + 'static + Sync + Send> FileEntry for TestFileEntry<Hooks> {
-    fn create(data_size: u64, block_size: u64, encoded_file_path: RwLock<EncodedFilePath>) -> Self {
+    fn create(
+        data_size: u64,
+        block_size: u64,
+        generation: Generation,
+        encoded_file_path: RwLock<EncodedFilePath>,
+    ) -> Self {
         Self {
             inner: Some(FileEntryImpl::create(
                 data_size,
                 block_size,
+                generation,
                 encoded_file_path,
             )),
             _phantom: PhantomData,
@@ -103,11 +109,12 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> FileEntry for TestFileEntry<
 
     async fn make_and_open_file(
         block_size: u64,
+        generation: Generation,
         encoded_file_path: EncodedFilePath,
     ) -> Result<(Self, fs::FileSlot, OsString), Error> {
         Hooks::on_make_and_open(&encoded_file_path).await?;
         let (inner, file_slot, path) =
-            FileEntryImpl::make_and_open_file(block_size, encoded_file_path).await?;
+            FileEntryImpl::make_and_open_file(block_size, generation, encoded_file_path).await?;
         Ok((
             Self {
                 inner: Some(inner),
@@ -132,6 +139,10 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> FileEntry for TestFileEntry<
 
     fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath> {
         self.inner.as_ref().unwrap().get_encoded_file_path()
+    }
+
+    fn generation(&self) -> Generation {
+        self.inner.as_ref().unwrap().generation()
     }
 
     async fn read_file_part(&self, offset: u64, length: u64) -> Result<Take<fs::FileSlot>, Error> {
@@ -334,6 +345,102 @@ async fn assert_entries_readable(store: &FilesystemStore) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+/// Return value is "is duplicate"
+async fn check_duplicate_files<Fe>(
+    evicting_map: &Arc<FsEvictingMap<'_, Fe>>,
+    key: &StoreKey<'static>,
+    entry: &Arc<Fe>,
+) -> Result<bool, Error>
+where
+    Fe: FileEntry,
+{
+    const CHUNK_SIZE: usize = 16 * 1024; // 16kb chunks, kinda picked out of the air
+
+    let new_encoded_file_path = entry.get_encoded_file_path().write().await;
+    let maybe_existing_item = evicting_map.get(&key.borrow().into_owned()).await;
+    let Some(existing_item) = maybe_existing_item else {
+        trace!(
+            new_file = ?new_encoded_file_path.get_file_path(entry.generation()),
+            "No existing entry, so not duplicate"
+        );
+        return Ok(false);
+    };
+    if Arc::ptr_eq(entry, &existing_item) {
+        warn!("Tried to check duplicate of an entry we already have!");
+        return Ok(true);
+    }
+    let existing_item_encoded_file_path = existing_item.get_encoded_file_path().write().await;
+    if entry.data_size() != existing_item.data_size() {
+        trace!(
+            entry_data_size = entry.data_size(),
+            existing_data_size = existing_item.data_size(),
+            existing_path = ?existing_item_encoded_file_path.get_file_path(existing_item.generation()),
+            "Different data sizes, so non-duplicate"
+        );
+        return Ok(false);
+    }
+
+    let file_length = entry.data_size();
+    let existing_path = existing_item_encoded_file_path.get_file_path(existing_item.generation());
+    let new_path = new_encoded_file_path.get_file_path(entry.generation());
+    trace!(?existing_path, ?new_path, "Checking duplicate files");
+    let mut new_file = fs::open_file(&new_path, 0, file_length).await?;
+    let mut existing_file = fs::open_file(&existing_path, 0, file_length).await?;
+
+    let mut new_buffer: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
+    let mut existing_buffer: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
+    // in a file_length file, there are 0 to file_length-1 entries
+    // not file_length. It's counting all the bytes, starting from 0
+    for offset in (0..file_length - 1).step_by(CHUNK_SIZE) {
+        let buffer_size = if offset + (CHUNK_SIZE as u64) <= file_length {
+            CHUNK_SIZE
+        } else if file_length < CHUNK_SIZE as u64 {
+            usize::try_from(file_length).expect("Always succeeds because file_length < 16384")
+        } else {
+            usize::try_from(file_length - offset).expect("Always succeeds because offset < file_length, and offset-file_length must be < 16384")
+        };
+        if let Err(err) = new_file.read_exact(&mut new_buffer[0..buffer_size]).await {
+            warn!(
+                ?err,
+                ?new_path,
+                file_length,
+                offset,
+                buffer_size,
+                "Failed to read new file, skipping duplicate check"
+            );
+            return Ok(false);
+        }
+        if let Err(err) = existing_file
+            .read_exact(&mut existing_buffer[0..buffer_size])
+            .await
+        {
+            warn!(
+                ?err,
+                ?existing_path,
+                file_length,
+                offset,
+                buffer_size,
+                "Failed to read existing, skipping duplicate check"
+            );
+            return Ok(false);
+        }
+        if new_buffer.ne(&existing_buffer) {
+            trace!(
+                ?existing_path,
+                ?new_path,
+                "Files are different, so non-duplicate"
+            );
+            return Ok(false);
+        }
+    }
+    trace!(
+        ?existing_path,
+        ?new_path,
+        "Identical files, so don't need to edit, skipping emplace"
+    );
+    Ok(true)
 }
 
 const HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
@@ -550,26 +657,12 @@ async fn file_continues_to_stream_on_content_replace_test() -> Result<(), Error>
     tokio::task::yield_now().await;
 
     {
-        // Now ensure we only have 1 file in our temp path - we know it is a digest.
-        let (_permit, temp_dir_handle) = fs::read_dir(format!("{temp_path}/{DIGEST_FOLDER_V2}"))
-            .await
-            .err_tip(|| "Failed opening temp directory")?
-            .into_inner();
-        let mut read_dir_stream = ReadDirStream::new(temp_dir_handle);
-        let mut num_files = 0;
-        while let Some(temp_dir_entry) = read_dir_stream.next().await {
-            num_files += 1;
-            let path = temp_dir_entry?.path();
-            let data = read_file_contents(path.as_os_str()).await?;
-            assert_eq!(
-                &data[..],
-                VALUE1.as_bytes(),
-                "Expected file content to match"
-            );
-        }
+        // The replaced generation is unlinked where it sits rather than moved,
+        // so nothing lands in temp; the open reader below keeps the inode alive.
         assert_eq!(
-            num_files, 1,
-            "There should only be one file in the temp directory"
+            list_file_names(&format!("{temp_path}/{DIGEST_FOLDER_V2}")).await?,
+            Vec::<String>::new(),
+            "unref must not move the replaced file into the temp directory"
         );
     }
 
@@ -651,26 +744,12 @@ async fn file_gets_cleans_up_on_cache_eviction() -> Result<(), Error> {
     tokio::task::yield_now().await;
 
     {
-        // Now ensure we only have 1 file in our temp path - we know it is a digest.
-        let (_permit, temp_dir_handle) = fs::read_dir(format!("{temp_path}/{DIGEST_FOLDER_V2}"))
-            .await
-            .err_tip(|| "Failed opening temp directory")?
-            .into_inner();
-        let mut read_dir_stream = ReadDirStream::new(temp_dir_handle);
-        let mut num_files = 0;
-        while let Some(temp_dir_entry) = read_dir_stream.next().await {
-            num_files += 1;
-            let path = temp_dir_entry?.path();
-            let data = read_file_contents(path.as_os_str()).await?;
-            assert_eq!(
-                &data[..],
-                VALUE1.as_bytes(),
-                "Expected file content to match"
-            );
-        }
+        // The replaced generation is unlinked where it sits rather than moved,
+        // so nothing lands in temp; the open reader below keeps the inode alive.
         assert_eq!(
-            num_files, 1,
-            "There should only be one file in the temp directory"
+            list_file_names(&format!("{temp_path}/{DIGEST_FOLDER_V2}")).await?,
+            Vec::<String>::new(),
+            "unref must not move the replaced file into the temp directory"
         );
     }
 
@@ -1213,12 +1292,22 @@ async fn update_file_future_drops_before_rename() -> Result<(), Error> {
         drop(update_fut);
         drop(rename_pause_request_lock);
     }
-    // Grab the newly inserted item in our store.
-    let new_file_entry = store.get_file_entry_for_digest(&digest).await?;
-    assert!(
-        !Arc::ptr_eq(&first_file_entry, &new_file_entry),
-        "Expected file entries to not be the same"
-    );
+    // The emplace outlives the dropped future, but finishes on a background
+    // task, so wait for the replacement rather than assuming it already landed.
+    let new_file_entry = {
+        let deadline = SystemTime::now() + Duration::from_secs(1);
+        loop {
+            let entry = store.get_file_entry_for_digest(&digest).await?;
+            if !Arc::ptr_eq(&first_file_entry, &entry) {
+                break entry;
+            }
+            assert!(
+                SystemTime::now() < deadline,
+                "Expected file entries to not be the same"
+            );
+            sleep(Duration::from_millis(1)).await;
+        }
+    };
 
     // Ensure the entry we inserted was properly flagged as moved (from temp -> content dir).
     new_file_entry
@@ -2064,9 +2153,7 @@ async fn get_part_on_map_disk_divergence_warns_and_removes_entry() -> Result<(),
     Ok(())
 }
 
-/// unref must be idempotent when the file is already gone: the entry is
-/// marked Temp so a second unref early-returns instead of racing the
-/// vanished path again.
+/// A second unref must early-return rather than race the same path again.
 #[nativelink_test]
 async fn unref_is_idempotent_when_file_already_gone() -> Result<(), Error> {
     let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
@@ -2086,60 +2173,74 @@ async fn unref_is_idempotent_when_file_already_gone() -> Result<(), Error> {
     let content_file = content_file_path(&content_path, &StoreKey::Digest(digest)).await?;
     fs::remove_file(&content_file).await?;
 
-    // First unref: rename hits ENOENT (benign) and flips the entry to Temp.
+    // First unref: flips the entry to pending deletion.
     file_entry.unref().await;
-    // Second unref: must hit the Temp early-return, proving the flip stuck.
+    // Second unref: must hit the early-return, proving the flip stuck.
     file_entry.unref().await;
 
     assert!(
-        logs_contain("File is already a temp file"),
-        "second unref should early-return as a Temp file (idempotent)"
+        logs_contain("File is already scheduled for deletion"),
+        "second unref should early-return (idempotent)"
     );
 
     Ok(())
 }
 
-/// rename ENOENT is ambiguous: a missing temp directory must not be mistaken
-/// for a vanished source. With the source still present, unref must warn and
-/// leave the content file intact rather than flip to Temp and orphan it.
+/// An evicted file stays put while a reference is held and is unlinked when the
+/// last one drops — what `resolve_plain_files` relies on to hardlink off-lock.
 #[nativelink_test]
-async fn unref_does_not_orphan_content_file_when_temp_dir_missing() -> Result<(), Error> {
-    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+async fn evicted_file_outlives_resolved_path_until_last_reference_drops() -> Result<(), Error> {
+    let digest1 = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let digest2 = DigestInfo::try_new(HASH2, VALUE2.len())?;
     let content_path = make_temp_path("content_path");
     let temp_path = make_temp_path("temp_path");
     let store = Box::pin(
         FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
             content_path: content_path.clone(),
             temp_path: temp_path.clone(),
-            eviction_policy: None,
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1,
+                ..Default::default()
+            }),
+            block_size: 1,
             ..Default::default()
         })
         .await?,
     );
-    store.update_oneshot(digest, VALUE1.into()).await?;
-    let file_entry = store.get_file_entry_for_digest(&digest).await?;
+    store.update_oneshot(digest1, VALUE1.into()).await?;
 
-    // Remove the temp dir so rename's destination parent is gone (ENOENT)
-    // while the source content file is perfectly intact.
-    fs::remove_dir_all(format!("{temp_path}/{DIGEST_FOLDER_V2}")).await?;
+    // Stand in for a resolved hardlink source: the path plus the keepalive
+    // reference that `PendingLink` holds while the link is pending.
+    let keepalive = store.get_file_entry_for_digest(&digest1).await?;
+    let resolved = content_file_path(&content_path, &StoreKey::Digest(digest1)).await?;
 
-    file_entry.unref().await;
-
-    assert!(
-        logs_contain("Failed to rename file"),
-        "missing temp dir (source present) must warn, not be treated as benign"
-    );
-    assert!(
-        !logs_contain("treating as benign"),
-        "an intact content file must not take the benign vanished-source path"
-    );
-    // The content file must still exist — not orphaned by a wrong Temp flip.
-    let content_file = content_file_path(&content_path, &StoreKey::Digest(digest)).await?;
+    store.update_oneshot(digest2, VALUE2.into()).await?;
     assert_eq!(
-        read_file_contents(&content_file).await?,
-        VALUE1.as_bytes(),
-        "content file must remain intact after a failed unref rename"
+        store.has(digest1).await?,
+        None,
+        "digest1 should have been evicted"
     );
+
+    assert_eq!(
+        list_file_names(&format!("{temp_path}/{DIGEST_FOLDER_V2}")).await?,
+        Vec::<String>::new(),
+        "eviction must not move the file into the temp directory"
+    );
+    assert_eq!(
+        read_file_contents(&resolved).await?,
+        VALUE1.as_bytes(),
+        "a path resolved before the eviction must still point at a live file"
+    );
+
+    drop(keepalive);
+    let deadline = SystemTime::now() + Duration::from_secs(10);
+    while Path::new(&resolved).exists() {
+        assert!(
+            SystemTime::now() < deadline,
+            "the file must be unlinked once the last reference drops"
+        );
+        sleep(Duration::from_millis(1)).await;
+    }
 
     Ok(())
 }
@@ -2443,8 +2544,7 @@ async fn upgrade_from_v1_folders_stamps_generation_on_all_keys() -> Result<(), E
     Ok(())
 }
 
-/// The pre-Dec-2024 layout kept every blob directly under `content_path`, so
-/// both migrations must run, in order.
+/// The pre-Dec-2024 layout kept blobs directly under `content_path`.
 #[nativelink_test]
 async fn upgrade_from_flat_layout_moves_digests_then_stamps_generation() -> Result<(), Error> {
     let content_path = make_temp_path("content_path");
@@ -2594,6 +2694,45 @@ async fn generations_assigned_after_upgrade_survive_restart() -> Result<(), Erro
     Ok(())
 }
 
+/// Both generations stranded on disk: startup keeps the newest.
+#[nativelink_test]
+async fn restart_with_two_generations_for_one_string_key() -> Result<(), Error> {
+    const STRANDED_KEY: &str = "foo";
+
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    fs::create_dir_all(format!("{content_path}/{STR_FOLDER_V2}")).await?;
+    fs::create_dir_all(format!("{content_path}/{DIGEST_FOLDER_V2}")).await?;
+
+    for (generation, value) in [(3, VALUE1), (7, VALUE2)] {
+        let path = format!("{content_path}/{STR_FOLDER_V2}/{STRANDED_KEY}-{generation}");
+        std::fs::write(&path, value).err_tip(|| format!("writing {path}"))?;
+    }
+
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: temp_path.clone(),
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    assert_eq!(
+        list_file_names(&format!("{content_path}/{STR_FOLDER_V2}")).await?,
+        vec![format!("{STRANDED_KEY}-7")],
+        "the newest generation should survive"
+    );
+    assert_eq!(
+        store
+            .get_part_unchunked(StoreKey::new_str(STRANDED_KEY), 0, None)
+            .await?,
+        Bytes::from(VALUE2),
+        "the map entry must serve the generation that is still on disk"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn partial_migration_stays_readable_and_retries_next_startup() -> Result<(), Error> {
     const STUCK_KEY: &str = "stuck";
@@ -2675,5 +2814,47 @@ async fn partial_migration_stays_readable_and_retries_next_startup() -> Result<(
         Bytes::from(VALUE1),
     );
 
+    Ok(())
+}
+
+/// The same invariant under a re-upload rather than an eviction.
+#[nativelink_test]
+async fn reupload_leaves_resolved_path_valid_while_entry_held() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: temp_path.clone(),
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let keepalive = store.get_file_entry_for_digest(&digest).await?;
+    let resolved = keepalive
+        .get_file_path_locked(|path| async move { Ok(path) })
+        .await?;
+
+    store.update_oneshot(digest, VALUE1.into()).await?;
+
+    assert_eq!(
+        read_file_contents(&resolved).await?,
+        VALUE1.as_bytes(),
+        "the re-upload must not strand the path resolved before it"
+    );
+    assert_eq!(
+        list_file_names(&format!("{temp_path}/{DIGEST_FOLDER_V2}")).await?,
+        Vec::<String>::new(),
+        "the replaced generation must not be moved into the temp directory"
+    );
+    assert_eq!(
+        store.get_part_unchunked(digest, 0, None).await?,
+        Bytes::from(VALUE1),
+    );
+
+    drop(keepalive);
     Ok(())
 }

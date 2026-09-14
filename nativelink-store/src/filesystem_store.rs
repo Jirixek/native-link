@@ -53,7 +53,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, Take};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReadDirStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::callback_utils::RemoveCallbackHolder;
 use crate::cas_utils::is_zero_digest;
@@ -109,12 +109,16 @@ pub struct SharedContext {
 
 #[derive(Eq, PartialEq, Debug)]
 enum PathType {
+    // A file goes through states as follows:
+    // PendingAddition --> Content --> PendingDeletion
+    TempPendingAddition,
+    CustomPendingAddition(OsString),
     Content,
-    Temp,
-    Custom(OsString),
+    TempPendingDeletion,
+    ContentPendingDeletion,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Generation(u64);
 
 impl Generation {
@@ -143,18 +147,19 @@ pub struct EncodedFilePath {
     shared_context: Arc<SharedContext>,
     path_type: PathType,
     key: StoreKey<'static>,
+    // We duplicate the generation field to be able to use it in the destructor.
     generation: Generation,
     version: Version,
 }
 
 impl EncodedFilePath {
     #[inline]
-    fn get_file_path(&self) -> Cow<'_, OsStr> {
+    pub fn get_file_path(&self, generation: Generation) -> Cow<'_, OsStr> {
         get_file_path_raw(
             &self.path_type,
             self.shared_context.as_ref(),
             &self.key,
-            self.generation,
+            generation,
             self.version,
         )
     }
@@ -168,12 +173,101 @@ fn get_file_path_raw<'a>(
     generation: Generation,
     version: Version,
 ) -> Cow<'a, OsStr> {
-    let folder = match path_type {
-        PathType::Content => &shared_context.content_path,
-        PathType::Temp => &shared_context.temp_path,
-        PathType::Custom(path) => return Cow::Borrowed(path),
-    };
-    Cow::Owned(to_full_path_from_key(folder, key, generation, version))
+    match path_type {
+        PathType::Content | PathType::ContentPendingDeletion => Cow::Owned(to_full_path_from_key(
+            &shared_context.content_path,
+            key,
+            generation,
+            version,
+        )),
+        PathType::TempPendingAddition | PathType::TempPendingDeletion => Cow::Owned(
+            to_full_path_from_key(&shared_context.temp_path, key, generation, Version::V2),
+        ),
+        PathType::CustomPendingAddition(path) => Cow::Borrowed(path),
+    }
+}
+
+impl EncodedFilePath {
+    async fn add_to_cache_dir(
+        &mut self,
+        key: StoreKey<'static>,
+        rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
+    ) -> Result<(), Error> {
+        match self.path_type {
+            PathType::TempPendingAddition | PathType::CustomPendingAddition(_) => {}
+            PathType::Content
+            | PathType::TempPendingDeletion
+            | PathType::ContentPendingDeletion => return Ok(()),
+        }
+
+        let final_path = get_file_path_raw(
+            &PathType::Content,
+            self.shared_context.as_ref(),
+            &key,
+            self.generation,
+            Version::V2,
+        );
+
+        let from_path = self.get_file_path(self.generation);
+
+        // Lock the blob down as read-only *before* it lands at its final
+        // content path, so every hardlink of it (the worker directory cache
+        // and `download_to_directory`) inherits an immutable, read-only
+        // inode. This is what preserves the input-tree hermeticity contract
+        // (actions cannot mutate their inputs) without a per-materialization
+        // chmod walk, and it means callers must never `chmod` a hardlinked
+        // blob — anything needing a different mode (e.g. an executable's +x
+        // bit) must take a private copy. Content-addressed blobs are
+        // write-once and replaced by `rename` rather than in-place writes,
+        // and unlink only needs the *parent directory* to be writable, so a
+        // read-only file mode is safe for both overwrite-by-rename and
+        // eviction. Best-effort: a failure here (e.g. the temp file was
+        // already evicted out from under us) must not abort the emplace.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) =
+                fs::set_permissions(&from_path, std::fs::Permissions::from_mode(0o444)).await
+            {
+                warn!(?err, ?from_path, "Failed to set CAS blob read-only");
+            }
+        }
+
+        let from_owned = from_path.to_os_string();
+        let to_owned = final_path.to_os_string();
+        fs::call_with_permit(move |_| rename_fn(&from_owned, &to_owned).map_err(Into::into))
+            .await
+            .err_tip(|| {
+                format!(
+                    "Failed to rename temp file to final path {}",
+                    final_path.display()
+                )
+            })?;
+
+        trace!(?key, "Finished emplace file");
+
+        self.path_type = PathType::Content;
+        self.key = key;
+        self.version = Version::V2;
+
+        Ok(())
+    }
+
+    fn evict_from_cache_dir(&mut self) {
+        match self.path_type {
+            // A generation makes this path unique, so no later entry wants the
+            // name. Leaving the file where it is keeps paths callers already
+            // resolved valid until the last of them drops the entry.
+            PathType::Content => self.path_type = PathType::ContentPendingDeletion,
+            // Never published, so it is already where `drop()` will delete it.
+            PathType::TempPendingAddition => self.path_type = PathType::TempPendingDeletion,
+            PathType::CustomPendingAddition(_) => {}
+            PathType::TempPendingDeletion | PathType::ContentPendingDeletion => warn!(
+                key = ?self.key,
+                "File is already scheduled for deletion",
+            ),
+        }
+    }
 }
 
 impl Drop for EncodedFilePath {
@@ -184,7 +278,7 @@ impl Drop for EncodedFilePath {
             return;
         }
 
-        let file_path = self.get_file_path().to_os_string();
+        let file_path = self.get_file_path(self.generation).to_os_string();
         let shared_context = self.shared_context.clone();
         // .fetch_add returns previous value, so we add one to get approximate current value
         let current_active_drop_spawns = shared_context
@@ -255,11 +349,17 @@ fn to_full_path_from_key(
 
 pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     /// Responsible for creating the underlying `FileEntry`.
-    fn create(data_size: u64, block_size: u64, encoded_file_path: RwLock<EncodedFilePath>) -> Self;
+    fn create(
+        data_size: u64,
+        block_size: u64,
+        generation: Generation,
+        encoded_file_path: RwLock<EncodedFilePath>,
+    ) -> Self;
 
     /// Creates a (usually) temp file, opens it and returns the path to the temp file.
     fn make_and_open_file(
         block_size: u64,
+        generation: Generation,
         encoded_file_path: EncodedFilePath,
     ) -> impl Future<Output = Result<(Self, FileSlot, OsString), Error>> + Send
     where
@@ -276,6 +376,9 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
 
     /// Gets the underlying `EncodedfilePath`.
     fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath>;
+
+    /// Returns the file generation.
+    fn generation(&self) -> Generation;
 
     /// Returns a reader that will read part of the underlying file.
     fn read_file_part(
@@ -305,6 +408,7 @@ pub struct FileEntryImpl {
     block_size: u64,
     // We lock around this as it gets rewritten when we move between temp and content types
     encoded_file_path: RwLock<EncodedFilePath>,
+    generation: Generation,
 }
 
 impl FileEntryImpl {
@@ -314,11 +418,17 @@ impl FileEntryImpl {
 }
 
 impl FileEntry for FileEntryImpl {
-    fn create(data_size: u64, block_size: u64, encoded_file_path: RwLock<EncodedFilePath>) -> Self {
+    fn create(
+        data_size: u64,
+        block_size: u64,
+        generation: Generation,
+        encoded_file_path: RwLock<EncodedFilePath>,
+    ) -> Self {
         Self {
             data_size,
             block_size,
             encoded_file_path,
+            generation,
         }
     }
 
@@ -327,9 +437,10 @@ impl FileEntry for FileEntryImpl {
     /// try to cleanup the file as well during `drop()`.
     async fn make_and_open_file(
         block_size: u64,
+        generation: Generation,
         encoded_file_path: EncodedFilePath,
     ) -> Result<(Self, FileSlot, OsString), Error> {
-        let temp_full_path = encoded_file_path.get_file_path().to_os_string();
+        let temp_full_path = encoded_file_path.get_file_path(generation).to_os_string();
         let temp_file_result = fs::create_file(temp_full_path.clone())
             .or_else(|mut err| async {
                 let remove_result = fs::remove_file(&temp_full_path).await.err_tip(|| {
@@ -355,6 +466,7 @@ impl FileEntry for FileEntryImpl {
             <Self as FileEntry>::create(
                 0, /* Unknown yet, we will fill it in later */
                 block_size,
+                generation,
                 RwLock::new(encoded_file_path),
             ),
             temp_file_result,
@@ -376,6 +488,10 @@ impl FileEntry for FileEntryImpl {
 
     fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath> {
         &self.encoded_file_path
+    }
+
+    fn generation(&self) -> Generation {
+        self.generation
     }
 
     fn read_file_part(
@@ -405,7 +521,12 @@ impl FileEntry for FileEntryImpl {
         handler: F,
     ) -> Result<T, Error> {
         let encoded_file_path = self.get_encoded_file_path().read().await;
-        handler(encoded_file_path.get_file_path().to_os_string()).await
+        handler(
+            encoded_file_path
+                .get_file_path(self.generation)
+                .to_os_string(),
+        )
+        .await
     }
 }
 
@@ -717,72 +838,7 @@ impl LenEntry for FileEntryImpl {
     #[inline]
     async fn unref(&self) {
         let mut encoded_file_path = self.encoded_file_path.write().await;
-        if encoded_file_path.path_type == PathType::Temp {
-            // We are already a temp file that is now marked for deletion on drop.
-            // This is very rare, but most likely the rename into the content path failed.
-            warn!(
-                key = ?encoded_file_path.key,
-                "File is already a temp file",
-            );
-            return;
-        }
-        let from_path = encoded_file_path.get_file_path();
-        let new_key = make_temp_key(&encoded_file_path.key);
-
-        let to_path = to_full_path_from_key(
-            &encoded_file_path.shared_context.temp_path,
-            &new_key,
-            encoded_file_path.generation,
-            encoded_file_path.version,
-        );
-
-        if let Err(err) = fs::rename(&from_path, &to_path).await {
-            // ENOENT from rename is ambiguous: the source may be gone, or
-            // a directory component of the destination (the temp dir) may
-            // be missing. Confirm the source is genuinely gone before
-            // treating it as benign — otherwise a removed temp dir would
-            // flip an intact content file to Temp and orphan it on disk.
-            let source_gone = err.code == Code::NotFound
-                && matches!(
-                    fs::metadata(&from_path).await,
-                    Err(meta_err) if meta_err.code == Code::NotFound
-                );
-            if source_gone {
-                // The file is already gone — typically another thread's
-                // eviction beat us, or the entry never got its file on
-                // disk. Benign here, and it dominates log volume under
-                // heavy write+evict concurrency, so keep it at `debug`.
-                // Mark the entry Temp (as a successful rename would) so a
-                // repeat unref is a no-op and drop stops claiming the
-                // content path.
-                debug!(
-                    key = ?encoded_file_path.key,
-                    "Failed to rename file (already gone, treating as benign)",
-                );
-                encoded_file_path.path_type = PathType::Temp;
-                encoded_file_path.key = new_key;
-            } else {
-                // Either a non-ENOENT failure (EACCES, EXDEV, EBUSY, …) or
-                // ENOENT with the source still present (missing temp dir).
-                // The content file is intact; leave the entry as Content.
-                warn!(
-                    key = ?encoded_file_path.key,
-                    ?from_path,
-                    ?to_path,
-                    ?err,
-                    "Failed to rename file",
-                );
-            }
-        } else {
-            debug!(
-                key = ?encoded_file_path.key,
-                ?from_path,
-                ?to_path,
-                "Renamed file (unref)",
-            );
-            encoded_file_path.path_type = PathType::Temp;
-            encoded_file_path.key = new_key;
-        }
+        encoded_file_path.evict_from_cache_dir();
     }
 }
 
@@ -819,7 +875,7 @@ pub fn key_and_generation_from_file_v2(
 /// `add_files_to_cache`.
 const SIMULTANEOUS_METADATA_READS: usize = 200;
 
-type FsEvictingMap<'a, Fe> =
+pub type FsEvictingMap<'a, Fe> =
     EvictingMap<StoreKeyBorrow, StoreKey<'a>, Arc<Fe>, SystemTime, RemoveCallbackHolder>;
 
 async fn add_files_to_cache<Fe: FileEntry>(
@@ -847,9 +903,10 @@ async fn add_files_to_cache<Fe: FileEntry>(
             Version::V2 => key_and_generation_from_file_v2(file_name, file_type)?,
         };
 
-        let file_entry = Fe::create(
+        let file_entry = Arc::new(Fe::create(
             data_size,
             block_size,
+            generation,
             RwLock::new(EncodedFilePath {
                 shared_context: shared_context.clone(),
                 path_type: PathType::Content,
@@ -857,7 +914,8 @@ async fn add_files_to_cache<Fe: FileEntry>(
                 generation,
                 version,
             }),
-        );
+        ));
+
         let time_since_anchor = if let Ok(d) = anchor_time.duration_since(atime) {
             d
         } else {
@@ -869,13 +927,23 @@ async fn add_files_to_cache<Fe: FileEntry>(
             );
             Duration::ZERO
         };
-        evicting_map
-            .insert_with_time(
+        let (inserted, _) = evicting_map
+            .insert_with_time_if(
                 key.into_owned().into(),
-                Arc::new(file_entry),
+                file_entry.clone(),
+                |present_entry, new_entry| present_entry.generation() < new_entry.generation(),
                 i32::try_from(time_since_anchor.as_secs()).unwrap_or(i32::MAX),
             )
             .await;
+
+        if !inserted {
+            file_entry
+                .get_encoded_file_path()
+                .write()
+                .await
+                .evict_from_cache_dir();
+        }
+
         Ok(generation)
     }
 
@@ -1010,7 +1078,6 @@ async fn add_files_to_cache<Fe: FileEntry>(
         version: Version,
     ) -> Result<Generation, Error> {
         let file_infos = read_files(Some(folder), shared_context).await?;
-
         let path_root = format!("{}/{folder}", shared_context.content_path);
 
         let mut max_generation = 0;
@@ -1107,101 +1174,6 @@ async fn prune_temp_path(temp_path: &str) -> Result<(), Error> {
 // Sometimes we get files to emplace that are identical to the existing files
 // Due to the evict/remove/replace cycle taking some amount of time, we actually
 // want to drop these
-// Return value is "is duplicate"
-pub async fn check_duplicate_files<Fe>(
-    evicting_map: &Arc<FsEvictingMap<'_, Fe>>,
-    key: &StoreKey<'static>,
-    entry: &Arc<Fe>,
-) -> Result<bool, Error>
-where
-    Fe: FileEntry,
-{
-    let temp_file_encoded_file_path = entry.get_encoded_file_path().write().await;
-    let maybe_existing_item = evicting_map.get(&key.borrow().into_owned()).await;
-    if let Some(existing_item) = maybe_existing_item {
-        if Arc::ptr_eq(entry, &existing_item) {
-            warn!("Tried to check duplicate of an entry we already have!");
-            return Ok(true);
-        }
-        let existing_item_encoded_file_path = existing_item.get_encoded_file_path().write().await;
-        if entry.data_size() == existing_item.data_size() {
-            const CHUNK_SIZE: usize = 16 * 1024; // 16kb chunks, kinda picked out of the air
-            let file_length = entry.data_size();
-            let existing_path = existing_item_encoded_file_path.get_file_path();
-            let temp_path = temp_file_encoded_file_path.get_file_path();
-            trace!(?existing_path, ?temp_path, "Checking duplicate files");
-            let mut temp_file = fs::open_file(&temp_path, 0, file_length).await?;
-            let mut existing_file = fs::open_file(&existing_path, 0, file_length).await?;
-
-            let mut temp_buffer: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
-            let mut existing_buffer: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
-            // in a file_length file, there are 0 to file_length-1 entries
-            // not file_length. It's counting all the bytes, starting from 0
-            for offset in (0..file_length - 1).step_by(CHUNK_SIZE) {
-                let buffer_size = if offset + (CHUNK_SIZE as u64) <= file_length {
-                    CHUNK_SIZE
-                } else if file_length < CHUNK_SIZE as u64 {
-                    usize::try_from(file_length)
-                        .expect("Always succeeds because file_length < 16384")
-                } else {
-                    usize::try_from(file_length - offset).expect("Always succeeds because offset < file_length, and offset-file_length must be < 16384")
-                };
-                if let Err(err) = temp_file.read_exact(&mut temp_buffer[0..buffer_size]).await {
-                    warn!(
-                        ?err,
-                        ?temp_path,
-                        file_length,
-                        offset,
-                        buffer_size,
-                        "Failed to read temp file, skipping duplicate check"
-                    );
-                    return Ok(false);
-                }
-                if let Err(err) = existing_file
-                    .read_exact(&mut existing_buffer[0..buffer_size])
-                    .await
-                {
-                    warn!(
-                        ?err,
-                        ?existing_path,
-                        file_length,
-                        offset,
-                        buffer_size,
-                        "Failed to read existing, skipping duplicate check"
-                    );
-                    return Ok(false);
-                }
-                if temp_buffer.ne(&existing_buffer) {
-                    trace!(
-                        ?existing_path,
-                        ?temp_path,
-                        "Files are different, so non-duplicate"
-                    );
-                    return Ok(false);
-                }
-            }
-            trace!(
-                ?existing_path,
-                ?temp_path,
-                "Identical files, so don't need to edit, skipping emplace"
-            );
-            return Ok(true);
-        }
-        trace!(
-            entry_data_size = entry.data_size(),
-            existing_data_size = existing_item.data_size(),
-            existing_path = ?existing_item_encoded_file_path.get_file_path(),
-            "Different data sizes, so non-duplicate"
-        );
-    } else {
-        trace!(
-            temp_file = ?temp_file_encoded_file_path.get_file_path(),
-            "No existing entry, so not duplicate"
-        );
-    }
-    Ok(false)
-}
-
 /// Deletes a digest's `.exec` variant (see
 /// [`FilesystemStore::get_executable_hardlink_source`]) when that digest is
 /// evicted or replaced in the primary CAS `evicting_map`. Without this, the
@@ -1769,116 +1741,40 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         drop(temp_file);
 
         *entry.data_size_mut() = data_size;
-        self.emplace_file(final_key, Arc::new(entry)).await?;
+        self.emplace_file(final_key, entry).await?;
         Ok(data_size)
     }
 
-    async fn emplace_file(&self, key: StoreKey<'static>, entry: Arc<Fe>) -> Result<(), Error> {
-        // This sequence of events is quite tricky to understand due to the amount of triggers that
-        // happen, async'ness of it and the locking. So here is a breakdown of what happens:
-        // 1. Here will hold a write lock on any file operations of this FileEntry.
-        // 2. Then insert the entry into the evicting map. This may trigger an eviction of other
-        //    entries.
-        // 3. Eviction triggers `unref()`, which grabs a write lock on the evicted FileEntry
-        //    during the rename.
-        // 4. It should be impossible for items to be added while eviction is happening, so there
-        //    should not be a deadlock possibility. However, it is possible for the new FileEntry
-        //    to be evicted before the file is moved into place. Eviction of the newly inserted
-        //    item is not possible within the `insert()` call because the write lock inside the
-        //    eviction map. If an eviction of new item happens after `insert()` but before
-        //    `rename()` then we get to finish our operation because the `unref()` of the new item
-        //    will be blocked on us because we currently have the lock.
-        // 5. Move the file into place. Since we hold a write lock still anyone that gets our new
-        //    FileEntry (which has not yet been placed on disk) will not be able to read the file's
-        //    contents until we release the lock.
+    async fn emplace_file(&self, key: StoreKey<'static>, entry: Fe) -> Result<(), Error> {
         let evicting_map = self.evicting_map.clone();
         let rename_fn = self.rename_fn;
 
         // We need to guarantee that this will get to the end even if the parent future is dropped.
         // See: https://github.com/TraceMachina/nativelink/issues/495
         background_spawn!("filesystem_store_emplace_file", async move {
-            // Sometimes we get files to emplace that are identical to the existing files
-            // Due to the evict/remove/replace cycle taking some amount of time, we actually
-            // want to drop these
-            if check_duplicate_files(&evicting_map, &key, &entry).await? {
-                return Ok(());
+            {
+                let mut encoded_file_path = entry.get_encoded_file_path().write().await;
+                encoded_file_path
+                    .add_to_cache_dir(key.clone(), rename_fn)
+                    .await?;
             }
 
-            evicting_map
-                .insert(key.borrow().into_owned().into(), entry.clone())
+            let entry = Arc::new(entry);
+
+            let (inserted, _) = evicting_map
+                .insert_if(key.into(), entry.clone(), |present_entry, new_entry| {
+                    present_entry.generation() < new_entry.generation()
+                })
                 .await;
 
-            // The insert might have resulted in an eviction/unref so we need to check
-            // it still exists in there. But first, get the lock...
-            let mut encoded_file_path = entry.get_encoded_file_path().write().await;
-            // Then check it's still in there...
-            if evicting_map.get(&key).await.is_none() {
-                info!(%key, "Got eviction while emplacing, dropping");
-                return Ok(());
+            if !inserted {
+                entry
+                    .get_encoded_file_path()
+                    .write()
+                    .await
+                    .evict_from_cache_dir();
             }
 
-            let final_path = get_file_path_raw(
-                &PathType::Content,
-                encoded_file_path.shared_context.as_ref(),
-                &key,
-                encoded_file_path.generation,
-                encoded_file_path.version,
-            );
-
-            let from_path = encoded_file_path.get_file_path();
-
-            // Lock the blob down as read-only *before* it lands at its final
-            // content path, so every hardlink of it (the worker directory cache
-            // and `download_to_directory`) inherits an immutable, read-only
-            // inode. This is what preserves the input-tree hermeticity contract
-            // (actions cannot mutate their inputs) without a per-materialization
-            // chmod walk, and it means callers must never `chmod` a hardlinked
-            // blob — anything needing a different mode (e.g. an executable's +x
-            // bit) must take a private copy. Content-addressed blobs are
-            // write-once and replaced by `rename` rather than in-place writes,
-            // and unlink only needs the *parent directory* to be writable, so a
-            // read-only file mode is safe for both overwrite-by-rename and
-            // eviction. Best-effort: a failure here (e.g. the temp file was
-            // already evicted out from under us) must not abort the emplace.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    fs::set_permissions(&from_path, std::fs::Permissions::from_mode(0o444)).await
-                {
-                    warn!(?err, ?from_path, "Failed to set CAS blob read-only");
-                }
-            }
-            // Internally tokio spawns fs commands onto a blocking thread anyways.
-            // Since we are already on a blocking thread, we just need the `fs` wrapper to manage
-            // an open-file permit (ensure we don't open too many files at once).
-            let result = (rename_fn)(&from_path, &final_path).err_tip(|| {
-                format!(
-                    "Failed to rename temp file to final path {}",
-                    final_path.display()
-                )
-            });
-
-            // In the event our move from temp file to final file fails we need to ensure we remove
-            // the entry from our map.
-            // Remember: At this point it is possible for another thread to have a reference to
-            // `entry`, so we can't delete the file, only drop() should ever delete files.
-            if let Err(err) = result {
-                error!(?err, ?from_path, ?final_path, "Failed to rename file",);
-                // Warning: To prevent deadlock we need to release our lock or during `remove_if()`
-                // it will call `unref()`, which triggers a write-lock on `encoded_file_path`.
-                drop(encoded_file_path);
-                // It is possible that the item in our map is no longer the item we inserted,
-                // So, we need to conditionally remove it only if the pointers are the same.
-
-                evicting_map
-                    .remove_if(&key, |map_entry| Arc::<Fe>::ptr_eq(map_entry, &entry))
-                    .await;
-                return Err(err);
-            }
-            trace!(?key, "Finished emplace file");
-            encoded_file_path.path_type = PathType::Content;
-            encoded_file_path.key = key;
             Ok(())
         })
         .await
@@ -1964,13 +1860,16 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         &self,
         temp_key: StoreKey<'static>,
     ) -> Result<(Fe, FileSlot, OsString), Error> {
+        let generation = self.get_and_update_generation();
+
         Fe::make_and_open_file(
             self.block_size,
+            generation,
             EncodedFilePath {
                 shared_context: self.shared_context.clone(),
-                path_type: PathType::Temp,
+                path_type: PathType::TempPendingAddition,
                 key: temp_key,
-                generation: self.get_and_update_generation(),
+                generation,
                 version: Version::V2,
             },
         )
@@ -2102,7 +2001,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         drop(temp_file);
 
         *entry.data_size_mut() = data.len() as u64;
-        self.emplace_file(key.into_owned(), Arc::new(entry)).await
+        self.emplace_file(key.into_owned(), entry).await
     }
 
     async fn update_with_whole_file(
@@ -2125,14 +2024,16 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             // don't need to add, because zero length files are just assumed to exist
             return Ok((0, None));
         }
+        let generation = self.get_and_update_generation();
         let entry = Fe::create(
             file_size,
             self.block_size,
+            generation,
             RwLock::new(EncodedFilePath {
                 shared_context: self.shared_context.clone(),
-                path_type: PathType::Custom(path),
+                path_type: PathType::CustomPendingAddition(path),
                 key: key.borrow().into_owned(),
-                generation: self.get_and_update_generation(),
+                generation,
                 version: Version::V2,
             }),
         );
@@ -2143,7 +2044,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             file.advise_dontneed();
         }
         drop(file);
-        self.emplace_file(key.into_owned(), Arc::new(entry))
+        self.emplace_file(key.into_owned(), entry)
             .await
             .err_tip(|| "Could not move file into store in upload_file_to_store, maybe dest is on different volume?")?;
         return Ok((file_size, None));
